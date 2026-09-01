@@ -1,21 +1,21 @@
 # ============================================================
-# GitHub Actions — Build & Push to ACR
+# GitHub Actions — Build, Push, and Deploy
 # CI/CD pipeline for compliant deployments to Azure Container App.
 #
 # How it works:
 # 1. Builds Docker image with immutable compliance labels
-# 2. Pushes to ACR using admin credentials (no Azure AD auth needed)
-# 3. ACR emits Event Grid "ImagePushed" event
-# 4. Event Grid → Automation Runbook → az containerapp update
-#    (runs inside Azure with managed identity — bypasses CAP)
+# 2. Authenticates to Azure using GitHub OIDC (no stored credentials)
+# 3. Pushes the commit-tagged image to ACR
+# 4. Updates the Container App as the CI/CD service principal
 #
 # Compliance signals (tamper-proof):
 #   - Docker image labels: commit-sha, pipeline-run-id, branch, repo
 #     (immutable once pushed to ACR)
-#   - Activity Log caller: Automation MI (Azure AD enforced)
+#   - Activity Log caller: GitHub CI/CD service principal (Azure AD enforced)
 #
-# Required secrets:
-#   ACR_USERNAME / ACR_PASSWORD  — ACR admin credentials
+# Required repository variables:
+#   AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID
+#   ACR_NAME / RESOURCE_GROUP / CONTAINER_APP_NAME
 # ============================================================
 name: Deploy Container App
 
@@ -29,9 +29,12 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 env:
-  ACR_NAME: acrcompliancedemoenqgb2
+  ACR_NAME: ${{ vars.ACR_NAME }}
+  RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP }}
+  CONTAINER_APP_NAME: ${{ vars.CONTAINER_APP_NAME }}
   IMAGE_NAME: compliance-demo-api
 
 jobs:
@@ -41,18 +44,21 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Log in to Azure with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
       - name: Log in to ACR
-        run: |
-          echo "${{ secrets.ACR_PASSWORD }}" | \
-            docker login "${{ env.ACR_NAME }}.azurecr.io" \
-              -u "${{ secrets.ACR_USERNAME }}" --password-stdin
+        run: az acr login --name "$ACR_NAME"
 
       - name: Build and push image
         run: |
           SHA_TAG="${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}"
           LATEST_TAG="${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:latest"
 
-          # Immutable compliance labels — baked into the image, can't be tampered
           docker build \
             --label "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
             --label "org.opencontainers.image.revision=${{ github.sha }}" \
@@ -66,18 +72,43 @@ jobs:
             -t "$LATEST_TAG" \
             src/api/
 
-          # Push SHA-tagged image first (triggers Event Grid → deploy)
           docker push "$SHA_TAG"
-          # Push :latest as well (fallback reference)
           docker push "$LATEST_TAG"
-          echo "✅ Pushed: $SHA_TAG"
-          echo "🔄 Event Grid will trigger deployment automatically"
+          echo "Pushed: $SHA_TAG"
+
+      - name: Deploy commit image to Container App
+        run: |
+          IMAGE="${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          az containerapp update \
+            --name "$CONTAINER_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --image "$IMAGE" \
+            --set-env-vars \
+              "DEPLOYED_BY=pipeline" \
+              "COMMIT_SHA=${{ github.sha }}" \
+              "PIPELINE_RUN_ID=${{ github.run_id }}"
+
+      - name: Verify deployment health
+        run: |
+          FQDN=$(az containerapp show \
+            --name "$CONTAINER_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query properties.configuration.ingress.fqdn \
+            --output tsv)
+          curl --fail --show-error --silent \
+            --retry 12 \
+            --retry-all-errors \
+            --retry-delay 10 \
+            --connect-timeout 10 \
+            --max-time 180 \
+            "https://$FQDN/health"
+          echo "APP_URL=https://$FQDN" >> "$GITHUB_ENV"
 
       - name: Summary
         run: |
-          echo "### ✅ Image Pushed to ACR" >> $GITHUB_STEP_SUMMARY
+          echo "### Container App Deployed" >> $GITHUB_STEP_SUMMARY
           echo "- **Image**: \`${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Commit**: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Branch**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Deploy**: Automatic via Event Grid → Automation Runbook" >> $GITHUB_STEP_SUMMARY
-          echo "- **App URL**: https://ca-api-compliancedemo.ashypond-ed21e6b9.eastus2.azurecontainerapps.io" >> $GITHUB_STEP_SUMMARY
+          echo "- **Deploy**: GitHub OIDC service principal" >> $GITHUB_STEP_SUMMARY
+          echo "- **App URL**: $APP_URL" >> $GITHUB_STEP_SUMMARY
